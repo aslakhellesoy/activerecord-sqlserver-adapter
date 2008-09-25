@@ -1,6 +1,5 @@
 require 'active_record/connection_adapters/abstract_adapter'
 
-require 'base64'
 require 'bigdecimal'
 require 'bigdecimal/util'
 
@@ -42,11 +41,51 @@ module ActiveRecord
         raise ArgumentError, "Missing Database. Argument ':database' must be set in order for this adapter to work." unless config.has_key?(:database)
         database  = config[:database]
         host      = config[:host] ? config[:host].to_s : 'localhost'
-        driver_url = "DBI:ADO:Provider=SQLOLEDB;Data Source=#{host};Initial Catalog=#{database};User ID=#{username};Password=#{password};"
+        unless config[:trusted_connection]
+          driver_url = "DBI:ADO:Provider=SQLOLEDB;Data Source=#{host};Initial Catalog=#{database};User Id=#{username};Password=#{password};"
+        else
+          driver_url = "DBI:ADO:Provider=SQLOLEDB;Data Source=#{host};Initial Catalog=#{database};Trusted_Connection=Yes;"
+        end
       end
       conn      = DBI.connect(driver_url, username, password)
       conn["AutoCommit"] = autocommit
       ConnectionAdapters::SQLServerAdapter.new(conn, logger, [driver_url, username, password])
+    end
+    
+    # Overridden to include support for SQL server's lack of = operator on
+    # text/ntext/image columns LIKE operator is used instead
+    def self.sanitize_sql_hash(attrs)
+      conditions = attrs.map do |attr, value|
+        col = self.columns.find {|c| c.name == attr}
+        if col && col.respond_to?("is_special") && col.is_special
+          "#{table_name}.#{connection.quote_column_name(attr)} LIKE ?"
+        else
+          "#{table_name}.#{connection.quote_column_name(attr)} #{attribute_condition(value)}"
+        end
+      end.join(' AND ')
+      replace_bind_variables(conditions, expand_range_bind_variables(attrs.values))
+    end
+    
+    # In the case of SQL server, the lock value must follow the FROM clause
+    def self.construct_finder_sql(options)
+      scope = scope(:find)
+      sql  = "SELECT #{(scope && scope[:select]) || options[:select] || '*'} "
+      sql << "FROM #{(scope && scope[:from]) || options[:from] || table_name} "
+    
+      if ActiveRecord::Base.connection.adapter_name == "SQLServer" && !options[:lock].blank? # SQLServer
+        add_lock!(sql, options, scope) 
+      end
+    
+      add_joins!(sql, options, scope)
+      add_conditions!(sql, options[:conditions], scope)
+    
+      sql << " GROUP BY #{options[:group]} " if options[:group]
+    
+      add_order!(sql, options[:order], scope)
+      add_limit!(sql, options, scope)
+      add_lock!(sql, options, scope)  unless ActiveRecord::Base.connection.adapter_name == "SQLServer" #  SQLServer
+      #      $log.debug "database_helper: construct_finder_sql:  sql at end:  #{sql.inspect}"
+      sql
     end
   end # class Base
 
@@ -60,7 +99,7 @@ module ActiveRecord
         @is_special = sql_type =~ /text|ntext|image/i
         # TODO: check ok to remove @scale = scale_value
         # SQL Server only supports limits on *char and float types
-        @limit = nil unless @type == :float or @type == :string
+        @limit = nil unless @type == :string
       end
 
       def simplified_type(field_type)
@@ -85,7 +124,7 @@ module ActiveRecord
         else super
         end
       end
-      
+ 
       def cast_to_time(value)
         return value if value.is_a?(Time)
         time_array = ParseDate.parsedate(value)
@@ -105,7 +144,6 @@ module ActiveRecord
    
         if value.is_a?(DateTime)
           return Time.mktime(value.year, value.mon, value.day, value.hour, value.min, value.sec)
-          #return DateTime.new(value.year, value.mon, value.day, value.hour, value.min, value.sec)
         end
         
         return cast_to_time(value) if value.is_a?(Date) or value.is_a?(String) rescue nil
@@ -114,23 +152,54 @@ module ActiveRecord
       
       # TODO: Find less hack way to convert DateTime objects into Times
       
-      def self.string_to_time(value)
-        if value.is_a?(DateTime)
-          return Time.mktime(value.year, value.mon, value.day, value.hour, value.min, value.sec)
-        else
-          super
-        end
-      end
+     def self.string_to_time(value)
+       if value.is_a?(DateTime)
+         return Time.mktime(value.year, value.mon, value.day, value.hour, value.min, value.sec)
+       else
+         super
+       end
+     end
 
       # These methods will only allow the adapter to insert binary data with a length of 7K or less
       # because of a SQL Server statement length policy.
-      def self.string_to_binary(value) 
- 	      Base64.encode64(value) 
-      end 
- 	       
- 	    def self.binary_to_string(value) 
- 	      Base64.decode64(value) 
- 	    end 
+    #   def self.string_to_binary(value)
+    #     value.gsub(/(\r|\n|\0|\x1a)/) do
+    #       case $1
+    #         when "\r"   then  "%00"
+    #         when "\n"   then  "%01"
+    #         when "\0"   then  "%02"
+    #         when "\x1a" then  "%03"
+    #       end
+    #     end
+    #   end
+    # 
+    #   def self.binary_to_string(value)
+    #     value.gsub(/(%00|%01|%02|%03)/) do
+    #       case $1
+    #         when "%00"    then  "\r"
+    #         when "%01"    then  "\n"
+    #         when "%02\0"  then  "\0"
+    #         when "%03"    then  "\x1a"
+    #       end
+    #     end
+    #   end
+    # end
+
+      # These methods will only allow the adapter to insert binary data with a length of 7K or less
+      # because of a SQL Server statement length policy.
+      # Convert strings to hex before storing in the database
+      def self.string_to_binary(value)
+        "0x#{value.unpack("H*")[0]}"
+      end
+
+      def self.binary_to_string(value)
+       # TODO: Need to remove conditional pack (should always have to pack hex characters into blob)
+        # Assigning a value to a binary column causes the string_to_binary to hexify it
+        # This hex value is stored in the DB but the original value is retained in the 
+        # cache.  By forcing reload, the value coming into binary_to_string will always
+        # be hex.  Need to force reload or update the cached column's value to match what is sent to the DB.
+        value =~ /[^[:xdigit:]]/ ? value : [value].pack('H*')
+      end
     end
 
     # In ADO mode, this adapter will ONLY work on Windows systems, 
@@ -177,16 +246,19 @@ module ActiveRecord
     # [Linux strongmad 2.6.11-1.1369_FC4 #1 Thu Jun 2 22:55:56 EDT 2005 i686 i686 i386 GNU/Linux]
     class SQLServerAdapter < AbstractAdapter
     
+      # add synchronization to adapter to prevent 'invalid cursor state' error
+      require 'sync'
       def initialize(connection, logger, connection_options=nil)
         super(connection, logger)
         @connection_options = connection_options
+        @sql_connection_lock = Sync.new
       end
 
       def native_database_types
         {
           :primary_key => "int NOT NULL IDENTITY(1, 1) PRIMARY KEY",
           :string      => { :name => "varchar", :limit => 255  },
-          :text        => { :name => "text" },
+          :text        => { :name => "varchar(max)" },
           :integer     => { :name => "int" },
           :float       => { :name => "float", :limit => 8 },
           :decimal     => { :name => "decimal" },
@@ -194,7 +266,7 @@ module ActiveRecord
           :timestamp   => { :name => "datetime" },
           :time        => { :name => "datetime" },
           :date        => { :name => "datetime" },
-          :binary      => { :name => "image"},
+          :binary      => { :name => "varbinary(max)"},
           :boolean     => { :name => "bit"}
         }
       end
@@ -217,6 +289,27 @@ module ActiveRecord
         else
           'bigint'
         end
+      end
+      
+      # Returns a table's primary key and belonging sequence (not applicable to SQL server).
+      def pk_and_sequence_for(table_name)
+        @connection["AutoCommit"] = false
+        keys = []
+        execute("EXEC sp_helpindex '#{table_name}'") do |handle|
+          if handle.column_info.any?
+            pk_index = handle.detect {|index| index[1] =~ /primary key/ }
+            keys << pk_index[2] if pk_index
+          end
+        end
+        keys.length == 1 ? [keys.first, nil] : nil
+      ensure
+        @connection["AutoCommit"] = true
+      end
+      
+      # allows to set owner in table name with dot notation
+      def quote_table_name(name)
+        names = name.split('.')
+        names.size == 1 ? "[#{names[0]}]" : "[#{names[0]}].[#{names[1]}]"
       end
 
       # CONNECTION MANAGEMENT ====================================#
@@ -241,55 +334,76 @@ module ActiveRecord
       # Disconnects from the database
       
       def disconnect!
-        @connection.disconnect rescue nil
+        @sql_connection_lock.synchronize(:EX) do        
+          begin
+            @connection.disconnect 
+          rescue nil
+          end
+        end
       end
 
+      # Add synchronization for the db connection to ensure no one else is using this one 
+      # prevents 'invalid cursor state' error
       def select_rows(sql, name = nil)
         rows = []
         repair_special_columns(sql)
         log(sql, name) do
-          @connection.select_all(sql) do |row|
-            record = []
-            row.each do |col|
-              if col.is_a? DBI::Timestamp
-                record << col.to_time
-              else
-                record << col
+          @sql_connection_lock.synchronize(:EX) do 
+            @connection.select_all(sql) do |row|
+              record = []
+              row.each do |col|
+                if col.is_a? DBI::Timestamp
+                  record << col.to_time
+                else
+                  record << col
+                end
               end
+              rows << record
             end
-            rows << record
           end
         end
         rows
       end
-
-      def columns(table_name, name = nil)
+                  
+      def columns(table_name, name = nil)        
         return [] if table_name.blank?
         table_name = table_name.to_s if table_name.is_a?(Symbol)
         table_name = table_name.split('.')[-1] unless table_name.nil?
         table_name = table_name.gsub(/[\[\]]/, '')
         sql = %Q{
-          SELECT 
-            cols.COLUMN_NAME as ColName,  
-            cols.COLUMN_DEFAULT as DefaultValue,
-            cols.NUMERIC_SCALE as numeric_scale,
-            cols.NUMERIC_PRECISION as numeric_precision, 
-            cols.DATA_TYPE as ColType, 
-            cols.IS_NULLABLE As IsNullable,  
-            COL_LENGTH(cols.TABLE_NAME, cols.COLUMN_NAME) as Length,  
-            COLUMNPROPERTY(OBJECT_ID(cols.TABLE_NAME), cols.COLUMN_NAME, 'IsIdentity') as IsIdentity,  
-            cols.NUMERIC_SCALE as Scale 
-          FROM INFORMATION_SCHEMA.COLUMNS cols 
-          WHERE cols.TABLE_NAME = '#{table_name}'   
+SELECT
+clmns.name AS ColName,
+object_definition(clmns.default_object_id) as DefaultValue,
+CAST(clmns.scale AS int) AS numeric_scale,
+CAST(clmns.precision AS int) AS numeric_precision,
+usrt.name AS ColType,
+case clmns.is_nullable when 0 then 'NO' else 'YES' end AS IsNullable,
+CAST(CASE WHEN baset.name IN (N'nchar', N'nvarchar') AND clmns.max_length <> -1 THEN 
+clmns.max_length/2 ELSE clmns.max_length END AS int) AS Length,
+clmns.is_identity as IsIdentity
+FROM
+sys.tables AS tbl
+INNER JOIN sys.all_columns AS clmns ON clmns.object_id=tbl.object_id
+LEFT OUTER JOIN sys.types AS usrt ON usrt.user_type_id = clmns.user_type_id
+LEFT OUTER JOIN sys.types AS baset ON baset.user_type_id = clmns.system_type_id and 
+baset.user_type_id = baset.system_type_id
+WHERE
+(tbl.name=N'#{table_name}' )
+ORDER BY
+clmns.column_id ASC
         }
         # Comment out if you want to have the Columns select statment logged.
         # Personally, I think it adds unnecessary bloat to the log. 
         # If you do comment it out, make sure to un-comment the "result" line that follows
-        result = log(sql, name) { @connection.select_all(sql) }
+        result = log(sql, name) do 
+          @sql_connection_lock.synchronize(:EX) do
+            @connection.select_all(sql)
+          end
+        end
         #result = @connection.select_all(sql)
         columns = []
         result.each do |field|
-          default = field[:DefaultValue].to_s.gsub!(/[()\']/,"") =~ /null/i ? nil : field[:DefaultValue]
+          default = field[:DefaultValue].to_s.gsub!(/[()\']/,"") =~ /null|NULL/ ? nil : field[:DefaultValue]
           if field[:ColType] =~ /numeric|decimal/i
             type = "#{field[:ColType]}(#{field[:numeric_precision]},#{field[:numeric_scale]})"
           else
@@ -301,63 +415,72 @@ module ActiveRecord
         end
         columns
       end
+
+      def insert(sql, name = nil, pk = nil, id_value = nil, sequence_name = nil)
+        execute(sql, name)
+        id_value || select_one("SELECT scope_identity() AS Ident")["Ident"]
+      end
+
+      def update(sql, name = nil)
+        execute(sql, name) do |handle|
+          handle.rows
+        end || select_one("SELECT @@ROWCOUNT AS AffectedRows")["AffectedRows"]        
+      end
       
-      def empty_insert_statement(table_name)
-        "INSERT INTO #{table_name} DEFAULT VALUES"
-      end      
+      alias_method :delete, :update
 
-      def insert_sql(sql, name = nil, pk = nil, id_value = nil, sequence_name = nil)
-        super || select_value("SELECT @@IDENTITY AS Ident")
-      end
-
-      def update_sql(sql, name = nil)          
-        autoCommiting = @connection["AutoCommit"]
-        begin
-          begin_db_transaction if autoCommiting
-          execute(sql, name)
-          affectedRows = select_value("SELECT @@ROWCOUNT AS AffectedRows")
-          commit_db_transaction if autoCommiting
-          affectedRows
-        rescue
-          rollback_db_transaction if autoCommiting
-          raise
-        end                    
-      end
-
+      # override execute to synchronize the connection
       def execute(sql, name = nil)
         if sql =~ /^\s*INSERT/i && (table_name = query_requires_identity_insert?(sql))
           log(sql, name) do
             with_identity_insert_enabled(table_name) do 
-              @connection.execute(sql) do |handle|
-                yield(handle) if block_given?
+              @sql_connection_lock.synchronize(:EX) do     
+                @connection.execute(sql) do |handle|
+                  yield(handle) if block_given?
+                end
               end
             end
           end
         else
           log(sql, name) do
-            @connection.execute(sql) do |handle|
-              yield(handle) if block_given?
+            @sql_connection_lock.synchronize(:EX) do     
+              @connection.execute(sql) do |handle|
+                yield(handle) if block_given?
+              end
             end
           end
         end
       end
 
+      # Add synchronization for the db connection to ensure no one else is using this one 
+      # prevents 'Could not change transaction status' error      
       def begin_db_transaction
-        @connection["AutoCommit"] = false
-      rescue Exception => e
-        @connection["AutoCommit"] = true
+        @sql_connection_lock.synchronize(:EX) do
+          begin        
+            @connection["AutoCommit"] = false
+          rescue Exception => e
+            @connection["AutoCommit"] = true
+          end
+        end
       end
-
       def commit_db_transaction
-        @connection.commit
-      ensure
-        @connection["AutoCommit"] = true
+        @sql_connection_lock.synchronize(:EX) do        
+          begin      
+            @connection.commit
+          ensure
+            @connection["AutoCommit"] = true
+          end
+        end
       end
 
       def rollback_db_transaction
-        @connection.rollback
-      ensure
-        @connection["AutoCommit"] = true
+        @sql_connection_lock.synchronize(:EX) do        
+          begin
+            @connection.rollback
+          ensure
+            @connection["AutoCommit"] = true
+          end
+        end
       end
 
       def quote(value, column = nil)
@@ -381,6 +504,14 @@ module ActiveRecord
         string.gsub(/\'/, "''")
       end
 
+      def quoted_true
+        "1"
+      end
+
+      def quoted_false
+        "0"
+      end
+
       def quote_column_name(name)
         "[#{name}]"
       end
@@ -394,7 +525,7 @@ module ActiveRecord
           sql.sub!(/^\s*SELECT(\s+DISTINCT)?/i, "SELECT * FROM (SELECT TOP #{options[:limit]} * FROM (SELECT#{$1} TOP #{options[:limit] + options[:offset]} ")
           sql << ") AS tmp1"
           if options[:order]
-            order = options[:order].split(',').map do |field|
+            options[:order] = options[:order].split(',').map do |field|
               parts = field.split(" ")
               tc = parts[0]
               if sql =~ /\.\[/ and tc =~ /\./ # if column quoting used in query
@@ -408,7 +539,7 @@ module ActiveRecord
               end
               parts.join(' ')
             end.join(', ')
-            sql << " ORDER BY #{change_order_direction(order)}) AS tmp2 ORDER BY #{order}"
+            sql << " ORDER BY #{change_order_direction(options[:order])}) AS tmp2 ORDER BY #{options[:order]}"
           else
             sql << " ) AS tmp2"
           end
@@ -418,12 +549,7 @@ module ActiveRecord
           end unless options[:limit].nil?
         end
       end
-
-      def add_lock!(sql, options)
-        @logger.info "Warning: SQLServer :lock option '#{options[:lock].inspect}' not supported" if @logger && options.has_key?(:lock)
-        sql
-      end
-
+    
       def recreate_database(name)
         drop_database(name)
         create_database(name)
@@ -443,9 +569,9 @@ module ActiveRecord
 
       def tables(name = nil)
         execute("SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'", name) do |sth|
-          result = sth.inject([]) do |tables, field|
+          sth.inject([]) do |tables, field|
             table_name = field[0]
-            tables << table_name unless table_name == 'dtproperties'            
+            tables << table_name unless table_name == 'dtproperties'
             tables
           end
         end
@@ -454,28 +580,34 @@ module ActiveRecord
       def indexes(table_name, name = nil)
         ActiveRecord::Base.connection.instance_variable_get("@connection")["AutoCommit"] = false
         indexes = []        
-        execute("EXEC sp_helpindex '#{table_name}'", name) do |handle|
-          if handle.column_info.any?
-            handle.each do |index| 
-              unique = index[1] =~ /unique/
-              primary = index[1] =~ /primary key/
-              if !primary
-                indexes << IndexDefinition.new(table_name, index[0], unique, index[2].split(", ").map {|e| e.gsub('(-)','')})
-              end
+        execute("EXEC sp_helpindex '#{table_name}'", name) do |sth|
+          sth.each do |index| 
+            unique = index[1] =~ /unique/
+            primary = index[1] =~ /primary key/
+            if !primary
+              indexes << IndexDefinition.new(table_name, index[0], unique, index[2].split(", "))
             end
           end
         end
         indexes
-      ensure
-        ActiveRecord::Base.connection.instance_variable_get("@connection")["AutoCommit"] = true
+        ensure
+          ActiveRecord::Base.connection.instance_variable_get("@connection")["AutoCommit"] = true
+      end
+
+      def add_order_by_for_association_limiting!(sql, options)
+        # Just skip ORDER BY clause. I dont know better solution for DISTINCT plus ORDER BY.
+        # And this doesnt cause to much problem..
+        return sql
       end
             
       def rename_table(name, new_name)
         execute "EXEC sp_rename '#{name}', '#{new_name}'"
       end
-
+      
+      # Adds a new column to the named table.
+      # See TableDefinition#column for details of the options you can use.
       def add_column(table_name, column_name, type, options = {})
-        add_column_sql = "ALTER TABLE #{table_name} ADD #{quote_column_name(column_name)} #{type_to_sql(type, options[:limit], options[:precision], options[:scale])}"      
+        add_column_sql = "ALTER TABLE #{table_name} ADD #{quote_column_name(column_name)} #{type_to_sql(type, options[:limit], options[:precision], options[:scale])}"
         add_column_options!(add_column_sql, options)
         # TODO: Add support to mimic date columns, using constraints to mark them as such in the database
         # add_column_sql << " CONSTRAINT ck__#{table_name}__#{column_name}__date_only CHECK ( CONVERT(CHAR(12), #{quote_column_name(column_name)}, 14)='00:00:00:000' )" if type == :date       
@@ -486,28 +618,71 @@ module ActiveRecord
         execute "EXEC sp_rename '#{table}.#{column}', '#{new_column_name}'"
       end
       
+      # database_statements line 108 Set the SQL specific rowlocking
+      # was previously generating invalid syntax for SQL server
+      def add_lock!(sql, options)
+        case lock = options[:lock]
+        when true then sql << "WITH(HOLDLOCK, ROWLOCK) "
+        when String then sql << "#{lock} "
+        end
+      end
+      
+      # Delete the default options if it's nil. Adapter was adding default NULL contraints 
+      # to all columns which caused problems when trying to alter the column
+      def add_column_options!(sql, options) #:nodoc:
+        options.delete(:default) if options[:default].nil? 
+        super
+      end
+
+      # calculate column size to fix issue
+      # size XXXXX given to the column 'data' exceeds the maximum allowed for any data type (8000)
+      def column_total_size(table_name)
+        return nil if table_name.blank?
+        table_name = table_name.to_s if table_name.is_a?(Symbol)
+        table_name = table_name.split('.')[-1] unless table_name.nil?
+        table_name = table_name.gsub(/[\[\]]/, '')
+        sql = %Q{
+                SELECT SUM(COL_LENGTH(cols.TABLE_NAME, cols.COLUMN_NAME)) as Length
+                FROM INFORMATION_SCHEMA.COLUMNS cols 
+                WHERE cols.TABLE_NAME = '#{table_name}'   
+        }
+        # Comment out if you want to have the Columns select statment logged.
+        # Personally, I think it adds unnecessary bloat to the log. If you do
+        # comment it out, make sure to un-comment the "result" line that follows
+        result = log(sql, name) do 
+          @sql_connection_lock.synchronize(:EX) { @connection.select_all(sql) }
+        end
+        field[:Length].to_i
+      end
+      
+      # if binary, calculate te the remaining amount for size
+      # issue: size XXXXX given to the column 'data' exceeds the maximum allowed for any data type (8000)
       def change_column(table_name, column_name, type, options = {}) #:nodoc:
-        sql = "ALTER TABLE #{table_name} ALTER COLUMN #{quote_column_name(column_name)} #{type_to_sql(type, options[:limit], options[:precision], options[:scale])}"
-        sql << " NOT NULL" if options[:null] == false
-        sql_commands = [sql]        
+        # $log.debug "change_column"
+        sql_commands = []
+        
+        # Handle conversion of text columns to binary columns by first
+        # converting to varchar. We determine the amount of space left for the
+        # columns so we can get the most out of the conversion.
+        if type == :binary
+          col = self.columns(table_name, column_name)
+          sql_commands << "ALTER TABLE #{table_name} ALTER COLUMN #{column_name} #{type_to_sql(:string, 8000 - column_total_size(table_name))}" if col && col.type == :text
+        end
+        
+        sql_commands << "ALTER TABLE #{table_name} ALTER COLUMN #{column_name} #{type_to_sql(type, options[:limit], options[:precision], options[:scale])}"
         if options_include_default?(options)
           remove_default_constraint(table_name, column_name)
-          sql_commands << "ALTER TABLE #{table_name} ADD CONSTRAINT DF_#{table_name}_#{column_name} DEFAULT #{quote(options[:default], options[:column])} FOR #{quote_column_name(column_name)}"
+          sql_commands << "ALTER TABLE #{table_name} ADD CONSTRAINT DF_#{table_name}_#{column_name} DEFAULT #{quote(options[:default], options[:column])} FOR #{column_name}"
         end
         sql_commands.each {|c|
           execute(c)
         }
       end
       
-      def change_column_default(table_name, column_name, default)
-        remove_default_constraint(table_name, column_name)
-        execute "ALTER TABLE #{table_name} ADD CONSTRAINT DF_#{table_name}_#{column_name} DEFAULT #{quote(default, column_name)} FOR #{quote_column_name(column_name)}"  
-      end
-      
       def remove_column(table_name, column_name)
         remove_check_constraints(table_name, column_name)
         remove_default_constraint(table_name, column_name)
-        execute "ALTER TABLE [#{table_name}] DROP COLUMN #{quote_column_name(column_name)}"
+        execute "ALTER TABLE [#{table_name}] DROP COLUMN [#{column_name}]"
       end
       
       def remove_default_constraint(table_name, column_name)
@@ -533,7 +708,23 @@ module ActiveRecord
       private 
         def select(sql, name = nil)
           repair_special_columns(sql)
-
+          if match = query_has_limit_and_offset?(sql) 
+            matched, limit, offset = *match 
+            execute(sql) 
+            # SET ROWCOUNT n causes all statements to only affect n rows, which we use 
+            # to delete offset rows from the temporary table 
+            execute("SET ROWCOUNT #{offset}") 
+            execute("DELETE from #limit_offset_temp") 
+            execute("SET ROWCOUNT 0") 
+            result = execute_select("SELECT * FROM #limit_offset_temp") 
+            execute("DROP TABLE #limit_offset_temp") 
+            result 
+          else 
+            execute_select(sql) 
+          end 
+        end 
+        
+        def execute_select(sql)
           result = []          
           execute(sql) do |handle|
             handle.each do |row|
@@ -550,6 +741,10 @@ module ActiveRecord
           result
         end
 
+        def query_has_limit_and_offset?(sql) 
+          match = sql.match(/#limit_offset_temp -- limit => (\d+) offset => (\d+)/) 
+        end 
+      
         # Turns IDENTITY_INSERT ON for table during execution of the block
         # N.B. This sets the state of IDENTITY_INSERT to OFF after the
         # block has been executed without regard to its previous state
@@ -623,5 +818,38 @@ module ActiveRecord
         end
 
     end #class SQLServerAdapter < AbstractAdapter
+    
+    # If value is a string and destination column is binary, don't quote the string for MS SQL
+    module Quoting
+      # Quotes the column value to help prevent
+      # {SQL injection attacks}[http://en.wikipedia.org/wiki/SQL_injection].
+      def quote(value, column = nil)
+        # records are quoted as their primary key
+        return value.quoted_id if value.respond_to?(:quoted_id)
+        #        puts "Type: #{column.type}  Name: #{column.name}" if column
+        case value
+        when String, ActiveSupport::Multibyte::Chars
+          value = value.to_s
+          if column && column.type == :binary && column.class.respond_to?(:string_to_binary) 
+            column.class.string_to_binary(value) 
+          elsif column && [:integer, :float].include?(column.type)
+            value = column.type == :integer ? value.to_i : value.to_f
+            value.to_s
+          else
+            "'#{quote_string(value)}'" # ' (for ruby-mode)
+          end
+        when NilClass                 then "NULL"
+        when TrueClass                then (column && column.type == :integer ? '1' : quoted_true)
+        when FalseClass               then (column && column.type == :integer ? '0' : quoted_false)
+        when Float, Fixnum, Bignum    then value.to_s
+          # BigDecimals need to be output in a non-normalized form and quoted.
+        when BigDecimal               then value.to_s('F')
+        when Date                     then "'#{value.to_s}'"
+        when Time, DateTime           then "'#{quoted_date(value)}'"
+        else                          "'#{quote_string(value.to_yaml)}'"
+        end
+      end    
+    end
+    
   end #module ConnectionAdapters
 end #module ActiveRecord
