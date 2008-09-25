@@ -17,6 +17,9 @@ http://github.com/adzap/sqlserver_adapter_mods/tree/master/lib/sqlserver_adapter
 
 This gem should support SQL Server 2005 but not 2000 because of type changes.
 
+Included ruby-dbi 0.2.2:
+- http://rubyforge.org/frs/download.php/41304/dbi-0.2.2.zip
+
 INSTALL
 =======
 
