@@ -1,0 +1,28 @@
+activerecord-sqlserver-adapter
+==============================
+
+Originally forked from http://svn.rubyonrails.org/rails/adapters/sqlserver/ 
+revision 9250
+
+Incorporates changes from: 
+
+- Redmine's fixes:
+http://www.redmine.org/attachments/817/sqlserver_adapter.rb
+
+- Github's jrafanie:
+http://github.com/jrafanie/rails-sqlserver-adapter/tree/master/sqlserver_adapter_rails.rb
+
+- Github's adzap:
+http://github.com/adzap/sqlserver_adapter_mods/tree/master/lib/sqlserver_adapter_mods
+
+This gem should support SQL Server 2005 but not 2000 because of type changes.
+
+INSTALL
+=======
+
+gem install akitaonrails-activerecord-sqlserver-adapter --source=http://gems.github.com
+
+Contact:
+========
+
+Fabio Akita (fabioakita@gmail.com)
